@@ -1,0 +1,6 @@
+# Downloaded GEO raw array archive and extracted files
+/input/GSE8825_RAW.tar
+/input/GSE8825_RAW/
+
+# Local RStudio project state
+/.Rproj.user/

@@ -1,0 +1,832 @@
+---
+title: "Brauer et al. (2008): Figure 2 Reproduction"
+author: "Bin via Codex"
+date: "2026-06-18 updated `r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+# Setup
+
+This analysis reproduces the hierarchically clustered expression matrix in
+Figure 2 using the authors' processed data. Code is folded by default and can
+be expanded using the **Code** controls.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+pkgs_cran <- c("pheatmap", "here")
+pkgs_bio  <- c("GEOquery")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+for (p in pkgs_bio)
+  if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p)
+
+for (p in pkgs_cran)
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+
+suppressPackageStartupMessages({
+  library(GEOquery)
+  library(pheatmap)
+  library(here)
+})
+
+i_am("analysis/20260618-Brauer-2008-reanalysis.Rmd")
+
+input_dir  <- here("input")
+output_dir <- here("output")
+#dir.create(input_dir, recursive = TRUE, showWarnings = FALSE)
+#dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+download_if_missing <- function(url, path) {
+  if (!file.exists(path)) {
+    message("Downloading ", basename(path), " ...")
+    utils::download.file(url, path, mode = "wb", quiet = FALSE)
+  } else {
+    message("Using cached ", basename(path))
+  }
+}
+
+```
+
+# Acquire processed data and current annotations
+
+The analysis caches the authors' raw TXT and CDT files, the latest available
+GPL884 record, and current SGD feature tables under `input/`. Existing files
+are never overwritten.
+
+```{r acquire-data}
+raw_path <- file.path(input_dir, "dilution_rate_00_raw.txt")
+cdt_path <- file.path(input_dir, "dilution_rate_00_raw.cdt")
+gpl_path <- file.path(input_dir, "GPL884.soft.gz")
+sgd_path <- file.path(input_dir, "SGD_features.tab")
+deleted_path <- file.path(input_dir, "deleted_merged_features.tab")
+
+download_if_missing(
+  "http://growthrate.princeton.edu/data/dilution_rate_00_raw.txt",
+  raw_path
+)
+download_if_missing(
+  "http://growthrate.princeton.edu/data/dilution_rate_00_raw.cdt",
+  cdt_path
+)
+download_if_missing(
+  "https://downloads.yeastgenome.org/curation/chromosomal_feature/SGD_features.tab",
+  sgd_path
+)
+download_if_missing(
+  "https://downloads.yeastgenome.org/curation/chromosomal_feature/deleted_merged_features.tab",
+  deleted_path
+)
+
+if (!file.exists(gpl_path)) {
+  message("Downloading current GPL884 annotation through GEOquery ...")
+  getGEO("GPL884", destdir = input_dir)
+}
+
+```
+
+# Reconcile the raw TXT and clustering CDT
+
+The TXT is the authoritative numeric source. The CDT is used to validate row
+identity and to recover its historical gene and probe identifiers.
+
+```{r reconcile-inputs}
+raw_data <- read.delim(
+  raw_path, check.names = FALSE, na.strings = "", quote = "\"",
+  stringsAsFactors = FALSE
+)
+cdt_data <- read.delim(
+  cdt_path, check.names = FALSE, na.strings = "", quote = "\"",
+  stringsAsFactors = FALSE
+)
+
+expr_cols <- grep("^[GNPSLU]0\\.[0-9]+$", names(raw_data), value = TRUE)
+stopifnot(
+  nrow(raw_data) == 5537L,
+  nrow(cdt_data) == 5537L,
+  length(expr_cols) == 36L,
+  identical(raw_data$GID, cdt_data$GID),
+  identical(raw_data$YORF, cdt_data$UID)
+)
+
+expr_raw <- as.matrix(raw_data[, expr_cols, drop = FALSE])
+expr_cdt <- as.matrix(cdt_data[, expr_cols, drop = FALSE])
+storage.mode(expr_raw) <- "numeric"
+storage.mode(expr_cdt) <- "numeric"
+stopifnot(sum(is.na(expr_raw)) == 866L)
+
+# The CDT contains the same ordered non-missing values, but omits interior
+# delimiters in 359 rows. This shifts values left, so it is not a numeric source.
+same_value_sequence <- vapply(seq_len(nrow(expr_raw)), function(i) {
+  identical(
+    as.vector(expr_raw[i, !is.na(expr_raw[i, ])]),
+    as.vector(expr_cdt[i, !is.na(expr_cdt[i, ])])
+  )
+}, logical(1))
+stopifnot(all(same_value_sequence))
+
+cdt_position_disagreement <- rowSums(
+  xor(is.na(expr_raw), is.na(expr_cdt)) |
+    ((!is.na(expr_raw) & !is.na(expr_cdt)) & expr_raw != expr_cdt)
+) > 0
+stopifnot(sum(cdt_position_disagreement) == 359L)
+
+```
+
+Both files contain **`r nrow(raw_data)` rows** in identical order and the same
+ordered non-missing measurements. The raw TXT contains **`r sum(is.na(expr_raw))`
+missing values**. The CDT shifts missing-value positions in
+**`r sum(cdt_position_disagreement)` rows**, so it is not used as an expression
+matrix.
+
+# Map probe IDs through GPL884 and current SGD
+
+Each stable Agilent probe UID is linked to GPL884 and then reconciled against
+current SGD features, including deleted and merged-feature mappings. No rows
+are discarded based on current annotation status.
+
+```{r map-annotations}
+gpl <- getGEO(filename = gpl_path)
+gpl_table <- Table(gpl)
+gpl_idx <- match(raw_data$YORF, gpl_table$SPOT_ID)
+stopifnot(!anyNA(gpl_idx))
+
+sgd_colnames <- c(
+  "sgd_id", "feature_type", "qualifier", "feature_name",
+  "standard_name", "aliases", "parent_feature", "secondary_sgd_id",
+  "chromosome", "start", "stop", "strand", "genetic_position",
+  "coordinate_version", "sequence_version", "description"
+)
+sgd <- read.delim(
+  sgd_path, header = FALSE, col.names = sgd_colnames, quote = "",
+  comment.char = "", fill = TRUE, stringsAsFactors = FALSE
+)
+deleted_colnames <- c(
+  "old_feature_name", "old_feature_type_status", "chromosome", "start",
+  "stop", "strand", "old_sgd_id", "old_secondary_sgd_id",
+  "replacement_feature_name", "replacement_sgd_id", "description",
+  "notes", "change_date"
+)
+deleted <- read.delim(
+  deleted_path, header = FALSE, col.names = deleted_colnames, quote = "",
+  comment.char = "", fill = TRUE, stringsAsFactors = FALSE
+)
+
+historical_id <- cdt_data$YORF
+direct_idx <- match(historical_id, sgd$feature_name)
+deleted_idx <- match(historical_id, deleted$old_feature_name)
+replacement_id <- deleted$replacement_feature_name[deleted_idx]
+replacement_id[is.na(replacement_id) | replacement_id == ""] <- NA_character_
+current_id <- historical_id
+current_id[is.na(direct_idx)] <- replacement_id[is.na(direct_idx)]
+current_idx <- match(current_id, sgd$feature_name)
+
+mapping_status <- ifelse(
+  !is.na(direct_idx), "current",
+  ifelse(!is.na(replacement_id), "merged_or_renamed", "unresolved")
+)
+
+gene_annotation <- data.frame(
+  row_key = raw_data$YORF,
+  gid = raw_data$GID,
+  probe_uid = raw_data$YORF,
+  cdt_historical_id = historical_id,
+  gpl_orf = gpl_table$ORF[gpl_idx],
+  gpl_feature_name = gpl_table$NAME[gpl_idx],
+  gpl_gene_symbol = gpl_table$GENE_SYMBOL[gpl_idx],
+  current_sgd_id = sgd$sgd_id[current_idx],
+  current_systematic_id = current_id,
+  current_standard_name = sgd$standard_name[current_idx],
+  current_feature_type = sgd$feature_type[current_idx],
+  current_qualifier = sgd$qualifier[current_idx],
+  mapping_status = mapping_status,
+  stringsAsFactors = FALSE
+)
+
+gpl_canonical_id <- ifelse(
+  nzchar(gene_annotation$gpl_orf), gene_annotation$gpl_orf,
+  gene_annotation$gpl_feature_name
+)
+gpl_cdt_disagreement <- gpl_canonical_id != historical_id
+
+write.csv(
+  gene_annotation,
+  file.path(output_dir, "figure2_gene_annotation.csv"),
+  row.names = FALSE, na = ""
+)
+
+# Stable, unique probe UIDs are retained as row keys even when historical
+# features now resolve to the same SGD feature.
+rownames(expr_raw) <- gene_annotation$row_key
+
+```
+
+All **`r sum(!is.na(gpl_idx))` / `r nrow(raw_data)`** probes map to GPL884.
+There are **`r sum(gpl_cdt_disagreement)`** GPL/CDT identifier disagreements,
+and **`r sum(!is.na(current_idx))` / `r nrow(raw_data)`** rows resolve to a
+current SGD feature.
+
+```{r annotation-summary, echo=FALSE}
+mapping_summary <- as.data.frame(
+  table(gene_annotation$mapping_status, useNA = "ifany"),
+  stringsAsFactors = FALSE
+)
+names(mapping_summary) <- c("Mapping status", "Rows")
+knitr::kable(mapping_summary, caption = "Current SGD mapping outcomes")
+
+qualifier_summary <- as.data.frame(
+  table(gene_annotation$current_qualifier, useNA = "ifany"),
+  stringsAsFactors = FALSE
+)
+names(qualifier_summary) <- c("SGD qualifier", "Rows")
+knitr::kable(qualifier_summary, caption = "Current SGD feature qualifiers")
+```
+
+The rows with empty "SGD qualifier" are either "blocked reading frame", "transposable element gene", or "pseudogene". These are not excluded from the analysis, as they were present in the original data and may still be biologically relevant.
+
+# Parse and validate sample metadata
+
+Sample metadata are parsed directly from the 36 expression-column names and
+validated as the complete six-nutrient by six-dilution-rate design.
+
+```{r sample-metadata}
+metadata_match <- regexec("^([GNPSLU])(0\\.[0-9]+)$", expr_cols)
+metadata_parts <- regmatches(expr_cols, metadata_match)
+stopifnot(all(lengths(metadata_parts) == 3L))
+
+pd_ordered <- data.frame(
+  sample = expr_cols,
+  nutrient = vapply(metadata_parts, `[`, character(1), 2L),
+  dil_rate = as.numeric(vapply(metadata_parts, `[`, character(1), 3L)),
+  stringsAsFactors = FALSE,
+  row.names = expr_cols
+)
+pd_ordered$nutrient <- factor(
+  pd_ordered$nutrient, levels = c("G", "N", "P", "S", "L", "U")
+)
+
+expected_design <- expand.grid(
+  nutrient = c("G", "N", "P", "S", "L", "U"),
+  dil_rate = c(0.05, 0.10, 0.15, 0.20, 0.25, 0.30),
+  stringsAsFactors = FALSE
+)
+observed_design <- data.frame(
+  nutrient = as.character(pd_ordered$nutrient),
+  dil_rate = pd_ordered$dil_rate
+)
+stopifnot(
+  !anyNA(pd_ordered),
+  !anyDuplicated(observed_design),
+  nrow(merge(expected_design, observed_design)) == 36L
+)
+
+```
+
+```{r sample-design-table, echo=FALSE}
+knitr::kable(pd_ordered, caption = "Experimental conditions")
+```
+
+# Figure 2 — Hierarchical clustering heatmap
+
+All 5,537 rows are clustered using pairwise-complete Pearson correlation and
+average-linkage UPGMA. Missing measurements are shown in gray.
+
+```{r cluster-genes}
+row_sd <- apply(expr_raw, 1, sd, na.rm = TRUE)
+stopifnot(all(is.finite(row_sd)), all(row_sd > 0))
+
+gene_cor <- cor(t(expr_raw), use = "pairwise.complete.obs", method = "pearson")
+stopifnot(all(is.finite(gene_cor)))
+gene_dist <- as.dist(1 - gene_cor)
+gene_clust <- hclust(gene_dist, method = "average")
+
+# Column annotation: nutrient & dilution rate
+col_ann <- data.frame(
+  Nutrient = pd_ordered$nutrient,
+  Rate = factor(pd_ordered$dil_rate),
+  row.names = colnames(expr_raw)
+)
+
+nutrient_colors <- c(G = "#E41A1C", N = "#377EB8", P = "#4DAF4A",
+                     S = "#984EA3", L = "#FF7F00", U = "#A65628")
+rate_palette    <- colorRampPalette(c("white","#2C7BB6"))(6)
+rate_breaks     <- sort(unique(pd_ordered$dil_rate))
+
+ann_colors <- list(
+  Nutrient = nutrient_colors,
+  Rate     = setNames(rate_palette, as.character(rate_breaks))
+)
+
+# The original figure uses seven integer-centered color bins. Assigning values
+# through matrix indexing preserves dimensions (unlike pmax() with a scalar as
+# its first argument, which can drop the matrix attributes).
+expr_binned <- round(expr_raw)
+expr_binned[expr_binned < -3] <- -3
+expr_binned[expr_binned > 3] <- 3
+
+# Color scale matching paper: green = down, black = 0, red = up
+# Paper uses log2 ratios (sample / glucose-limited 0.25 reference)
+heatmap_colors <- c(
+  "#008000", "#006000", "#003000",
+  "#000000",
+  "#500000", "#900000", "#CC0000"
+)
+heatmap_breaks <- seq(-3.5, 3.5, by = 1)
+heatmap_labels <- -3:3
+
+stopifnot(
+  identical(dim(expr_binned), dim(expr_raw)),
+  identical(dimnames(expr_binned), dimnames(expr_raw)),
+  length(heatmap_breaks) == length(heatmap_colors) + 1L,
+  length(heatmap_labels) == length(heatmap_colors),
+  all(expr_binned[!is.na(expr_binned)] %in% heatmap_labels)
+)
+```
+
+
+```{r render-figure-2, fig.width=8, fig.height=12, out.width="100%"}
+figure2_path <- file.path(output_dir, "figure2_hierarchical_clustering.png")
+png(figure2_path,
+    width = 2400, height = 3600, res = 200)
+
+pheatmap(
+  mat               = expr_binned,
+  color             = heatmap_colors,
+  breaks            = heatmap_breaks,
+  legend_breaks     = heatmap_labels,
+  legend_labels     = as.character(heatmap_labels),
+  cluster_cols      = FALSE,   # columns pre-ordered by nutrient/rate
+  cluster_rows      = gene_clust,
+  show_rownames     = FALSE,
+  show_colnames     = TRUE,
+  fontsize_col      = 7,
+  annotation_col    = col_ann,
+  annotation_colors = ann_colors,
+  border_color      = NA,
+  na_col            = "#BDBDBD",
+  main = paste0(
+    "Figure 2 — Hierarchical clustering of expression\n",
+    "across dilution rates and limiting nutrients\n",
+    "(5,537 rows; UPGMA, pairwise-complete Pearson correlation)"
+  )
+)
+dev.off()
+
+knitr::include_graphics(figure2_path)
+```
+
+The reproduced heatmap is saved to
+[`output/figure2_hierarchical_clustering.png`](../output/figure2_hierarchical_clustering.png),
+and the annotation audit is saved to
+[`output/figure2_gene_annotation.csv`](../output/figure2_gene_annotation.csv).
+
+# Identify the phosphate-specific cluster
+
+The paper describes a 133-gene cluster induced specifically during phosphate
+limitation. Two complementary definitions are evaluated here. The fixed rule
+requires a strong average phosphate signal, a low non-phosphate background,
+a minimum phosphate contrast, and consistent phosphate elevation at every
+matched dilution rate. The distribution-based method ranks all rows by a
+robust phosphate-specificity score.
+
+```{r phosphate-specificity}
+is_p <- grepl("^P", colnames(expr_raw))
+sample_rates <- sub("^[GNPSLU]", "", colnames(expr_raw))
+
+mean_p <- rowMeans(expr_raw[, is_p, drop = FALSE], na.rm = TRUE)
+mean_non_p <- rowMeans(expr_raw[, !is_p, drop = FALSE], na.rm = TRUE)
+p_effect <- mean_p - mean_non_p
+
+p_cols <- which(is_p)
+p_consistency_count <- vapply(seq_len(nrow(expr_raw)), function(i) {
+  sum(vapply(p_cols, function(j) {
+    same_rate_non_p <- which(!is_p & sample_rates == sample_rates[j])
+    is.finite(expr_raw[i, j]) &&
+      expr_raw[i, j] > mean(expr_raw[i, same_rate_non_p], na.rm = TRUE)
+  }, logical(1)))
+}, integer(1))
+
+# Fixed, interpretable thresholds on the log2 expression-ratio scale.
+phosphate_fixed <- (
+  mean_p >= 1 &
+  mean_non_p <= 0.5 &
+  p_effect >= 0.75 &
+  p_consistency_count == length(p_cols)
+)
+
+# Robust distribution score: phosphate median contrast standardized by the
+# non-phosphate median absolute deviation. The 0.1 floor prevents unstable
+# scores for nearly invariant rows.
+median_p <- apply(expr_raw[, is_p, drop = FALSE], 1, median, na.rm = TRUE)
+median_non_p <- apply(
+  expr_raw[, !is_p, drop = FALSE], 1, median, na.rm = TRUE
+)
+background_mad <- apply(
+  expr_raw[, !is_p, drop = FALSE], 1, mad, na.rm = TRUE
+)
+p_specificity_score <- (
+  median_p - median_non_p
+) / (background_mad + 0.1)
+
+p_specificity_rank <- rank(
+  -p_specificity_score, ties.method = "first", na.last = "keep"
+)
+phosphate_ranked <- !is.na(p_specificity_rank) & p_specificity_rank <= 133
+
+stopifnot(
+  sum(phosphate_fixed) == 133L,
+  sum(phosphate_ranked, na.rm = TRUE) == 133L
+)
+
+phosphate_candidates <- cbind(
+  gene_annotation,
+  mean_p = mean_p,
+  mean_non_p = mean_non_p,
+  p_effect = p_effect,
+  p_consistency_count = p_consistency_count,
+  median_p = median_p,
+  median_non_p = median_non_p,
+  background_mad = background_mad,
+  p_specificity_score = p_specificity_score,
+  p_specificity_rank = p_specificity_rank,
+  fixed_threshold_member = phosphate_fixed,
+  top_133_score_member = phosphate_ranked
+)
+
+phosphate_candidates <- phosphate_candidates[
+  order(phosphate_candidates$p_specificity_rank, na.last = TRUE),
+]
+
+phosphate_output_path <- file.path(
+  output_dir, "figure2_phosphate_specific_candidates.csv"
+)
+write.csv(
+  phosphate_candidates,
+  phosphate_output_path,
+  row.names = FALSE,
+  na = ""
+)
+```
+
+The fixed rule identifies **`r sum(phosphate_fixed)` rows**. The robust score
+independently selects its top **`r sum(phosphate_ranked, na.rm = TRUE)` rows**.
+The two definitions share **`r sum(phosphate_fixed & phosphate_ranked, na.rm = TRUE)`
+rows** (Jaccard similarity
+**`r round(sum(phosphate_fixed & phosphate_ranked, na.rm = TRUE) / sum(phosphate_fixed | phosphate_ranked, na.rm = TRUE), 3)`**).
+The fixed-rule count reproduces the reported cluster size, but matching the
+number 133 alone does not establish that its membership is identical to the
+manually identified dendrogram branch in the paper.
+
+```{r phosphate-method-summary, echo=FALSE}
+phosphate_summary <- data.frame(
+  Method = c(
+    "Fixed thresholds",
+    "Top robust specificity scores",
+    "Intersection"
+  ),
+  Rows = c(
+    sum(phosphate_fixed),
+    sum(phosphate_ranked, na.rm = TRUE),
+    sum(phosphate_fixed & phosphate_ranked, na.rm = TRUE)
+  )
+)
+knitr::kable(phosphate_summary, caption = "Phosphate-specific candidate sets")
+```
+
+The fixed-rule candidates show the expected phosphate-specific block across
+the six matched dilution rates.
+
+```{r phosphate-cluster-heatmap, fig.width=8, fig.height=8, out.width="85%"}
+phosphate_expr <- expr_raw[phosphate_fixed, , drop = FALSE]
+phosphate_cor <- cor(
+  t(phosphate_expr), use = "pairwise.complete.obs", method = "pearson"
+)
+stopifnot(all(is.finite(phosphate_cor)))
+phosphate_clust <- hclust(as.dist(1 - phosphate_cor), method = "average")
+
+pheatmap(
+  mat = phosphate_expr,
+  color = heatmap_colors,
+  breaks = heatmap_breaks,
+  legend_breaks = heatmap_labels,
+  legend_labels = as.character(heatmap_labels),
+  cluster_cols = FALSE,
+  cluster_rows = phosphate_clust,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  fontsize_col = 7,
+  annotation_col = col_ann,
+  annotation_colors = ann_colors,
+  border_color = NA,
+  na_col = "#BDBDBD",
+  main = "133 phosphate-specific candidates (fixed rule)"
+)
+```
+
+The complete ranking, thresholds, membership flags, and current annotations
+are available in
+[`output/figure2_phosphate_specific_candidates.csv`](../output/figure2_phosphate_specific_candidates.csv).
+
+## Why PHO84 is absent from the authors' processed matrix
+
+`PHO84` (`YML123C`; probe `A_06_P5417`) is present on GPL884 and in the
+original GSE8825 arrays, but it is absent from `dilution_rate_00_raw.txt` and
+therefore from the 5,537 rows clustered above. To investigate this discrepancy,
+the official GEO raw archive was downloaded from the
+[GSE8825 supplementary-file endpoint](https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE8825&format=file).
+The archive and its 36 gzip-compressed Agilent Feature Extraction files are
+cached under [`input/`](../input/); their provenance is recorded in
+[`input/README.md`](../input/README.md).
+
+The following code reads the PHO84 record directly from each original GSM raw
+file. The sorted GSM accessions correspond to the 36 expression columns in the
+GEO series matrix and in the authors' matrix.
+
+```{r investigate-pho84}
+geo_raw_dir <- file.path(input_dir, "GSE8825_RAW")
+geo_raw_files <- sort(list.files(
+  geo_raw_dir, pattern = "^GSM[0-9]+\\.txt\\.gz$", full.names = TRUE
+))
+stopifnot(length(geo_raw_files) == length(expr_cols))
+
+read_agilent_probe <- function(path, probe_id) {
+  raw_lines <- readLines(gzfile(path), warn = FALSE)
+  header_line <- grep("^FEATURES\tFeatureNum\t", raw_lines)[1]
+  probe_line <- grep(
+    paste0("\t", probe_id, "\t"), raw_lines,
+    fixed = TRUE
+  )
+  stopifnot(length(header_line) == 1L, length(probe_line) == 1L)
+
+  header <- strsplit(raw_lines[header_line], "\t", fixed = TRUE)[[1]]
+  values <- strsplit(raw_lines[probe_line], "\t", fixed = TRUE)[[1]]
+  as.data.frame(
+    as.list(stats::setNames(values, header)),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+}
+
+pho84_raw <- do.call(rbind, lapply(
+  geo_raw_files, read_agilent_probe, probe_id = "A_06_P5417"
+))
+pho84_raw$GSM <- sub("\\.txt\\.gz$", "", basename(geo_raw_files))
+pho84_raw$condition <- expr_cols
+
+numeric_raw_fields <- c(
+  "LogRatio", "gProcessedSignal", "rProcessedSignal",
+  "gIsWellAboveBG", "rIsWellAboveBG", "gIsSaturated", "rIsSaturated",
+  "gIsFeatNonUnifOL", "rIsFeatNonUnifOL",
+  "gIsFeatPopnOL", "rIsFeatPopnOL", "IsManualFlag"
+)
+pho84_raw[numeric_raw_fields] <- lapply(
+  pho84_raw[numeric_raw_fields], as.numeric
+)
+
+pho84_above_bg <- pho84_raw$condition[pho84_raw$gIsWellAboveBG == 1]
+stopifnot(
+  identical(pho84_above_bg, expr_cols[grepl("^P", expr_cols)]),
+  !"A_06_P5417" %in% raw_data$YORF,
+  all(pho84_raw$LogRatio[grepl("^P", pho84_raw$condition)] == 2)
+)
+
+pho84_quality_summary <- data.frame(
+  Check = c(
+    "Green channel above background",
+    "Red channel above background",
+    "Saturated in either channel",
+    "Non-uniform feature outlier in either channel",
+    "Population outlier in either channel",
+    "Manual flag"
+  ),
+  Arrays = c(
+    sum(pho84_raw$gIsWellAboveBG),
+    sum(pho84_raw$rIsWellAboveBG),
+    sum(pho84_raw$gIsSaturated | pho84_raw$rIsSaturated),
+    sum(pho84_raw$gIsFeatNonUnifOL | pho84_raw$rIsFeatNonUnifOL),
+    sum(pho84_raw$gIsFeatPopnOL | pho84_raw$rIsFeatPopnOL),
+    sum(pho84_raw$IsManualFlag)
+  )
+)
+knitr::kable(
+  pho84_quality_summary,
+  caption = "PHO84 quality flags in the 36 original Agilent arrays"
+)
+```
+
+The green channel passes Agilent's `gIsWellAboveBG` test in exactly
+**`r sum(pho84_raw$gIsWellAboveBG)` of 36 arrays**: the six phosphate-limited
+arrays (**`r paste(pho84_above_bg, collapse = ", ")`**). The red channel is
+above background in **`r sum(pho84_raw$rIsWellAboveBG)` arrays**. There is no
+saturation, non-uniform-feature, population-outlier, or manual flag for PHO84.
+
+GEO's sample metadata identifies channel 1/green/Cy3 as the shared
+glucose-limited reference culture at dilution rate 0.25, and
+channel 2/red/Cy5 as the nutrient-limited experimental culture. Thus red—not
+green—is the starvation/limitation sample. In all six phosphate arrays,
+PHO84 reaches the Feature Extraction ceiling of `LogRatio = 2`, corresponding
+to a 100-fold red-to-green ratio, or `log2(100) = 6.644` in the GEO series
+matrix.
+
+The authors' retained matrix has at most
+**`r max(rowSums(is.na(expr_raw)))` missing values per row**. PHO84's weak green
+reference signal in 30 of 36 arrays is therefore strongly consistent with its
+removal by an intensity/background-completeness filter before construction of
+the 5,537-row matrix. This is an inference from the original measurements and
+quality flags; without the authors' preprocessing code, the precise exclusion
+rule cannot be established definitively.
+
+# Figure 3 — deferred
+
+Figure 3 is intentionally held for later work. Its previous R implementation
+is retained below inside an HTML comment and is not evaluated by knitr.
+
+<!--
+if (FALSE) { # Deferred: Figure 3 is intentionally disabled.
+cat("\nComputing SVD for Figure 3...\n")
+
+# Center each gene (row) before SVD, as is standard
+expr_centered <- t(scale(t(expr_imp), center = TRUE, scale = FALSE))
+
+# SVD: X = U D V^T
+# Eigengenes are the rows of V^T (columns of V), scaled by singular values
+svd_res <- svd(expr_centered)
+
+# Fraction of variance explained by each eigengene
+eigenvalues   <- svd_res$d^2
+frac_variance <- eigenvalues / sum(eigenvalues)
+
+cat("Fraction variance — top 8 eigengenes:\n")
+print(round(frac_variance[1:8], 4))
+# Paper reports eigengene 1 = 43.6% of variation
+
+# Build data frame of eigengene projections
+# Columns of V (right singular vectors) = eigengene patterns across samples
+n_eig   <- 8   # show top 8 in panel B; use 4 for panel C traces
+V_mat   <- svd_res$v  # nrow = 36 samples, ncol = 36
+
+eigengene_df <- as.data.frame(V_mat[, 1:n_eig])
+colnames(eigengene_df) <- paste0("EG", 1:n_eig)
+eigengene_df$sample    <- colnames(expr_imp)
+eigengene_df$nutrient  <- pd_ordered$nutrient
+eigengene_df$dil_rate  <- pd_ordered$dil_rate
+eigengene_df$nutrient_fac <- factor(pd_ordered$nutrient,
+                                    levels = c("G","N","P","S","L","U"))
+
+# ── Panel A: heatmap of first 36 eigengenes (the V matrix) ────
+# Shows all 36 eigengenes × 36 samples (Figure 3A in paper)
+
+png("figure3_svd.png", width = 3200, height = 2600, res = 200)
+layout(matrix(c(1,1,2,3,3,3,3), nrow = 1), widths = c(2,0.6,3.4))
+
+# Panel A — eigengene heatmap (samples × eigengenes)
+par(mar = c(5,4,4,1))
+image(
+  1:36, 1:36,
+  t(V_mat[, 36:1]),   # flip so EG1 at top
+  col    = colorRampPalette(c("#008000","black","#CC0000"))(100),
+  xlab   = "Sample index",
+  ylab   = "Eigengene",
+  main   = "A  36 eigengenes",
+  axes   = FALSE
+)
+axis(1, at = seq(1,36,6), labels = seq(1,36,6), cex.axis=0.8)
+axis(2, at = c(1,18,36), labels = c("36","18","1"), cex.axis=0.8, las=1)
+
+# Panel B — eigenvalue bar chart
+par(mar = c(5,4,4,1))
+barplot(
+  frac_variance[1:8],
+  names.arg = paste0("EG",1:8),
+  horiz     = TRUE,
+  col       = c("#CC0000", rep("gray60", 7)),
+  border    = NA,
+  xlab      = "Fraction of variance",
+  main      = "B  Eigenvalues",
+  cex.names = 0.75,
+  cex.axis  = 0.75,
+  xlim      = c(0, 0.5)
+)
+text(frac_variance[1], 7.5,
+     paste0(round(frac_variance[1]*100,1),"%"),
+     pos=4, cex=0.75, col="darkred")
+
+# Panel C — expression of 4 top eigengenes across nutrient / rate
+# Replicate the 6-panel grid (one column per nutrient) × 4 rows (eigengenes)
+par(mar = c(0,0,0,0))  # reset before grid below
+dev.off()   # close first; redo with separate png for cleaner layout
+
+# ── Panel C as its own clean multi-panel plot ──────────────────
+# For each eigengene (1-4) × each nutrient (G,N,P,S,L,U):
+#   plot eigengene projection vs. dilution rate
+
+nutrients_ordered <- c("G","N","P","S","L","U")
+nut_labels        <- c(G="Glucose", N="Nitrogen", P="Phosphate",
+                       S="Sulfate", L="Leucine", U="Uracil")
+
+rates_all <- sort(unique(pd_ordered$dil_rate))  # 0.05…0.30
+
+make_eigengene_panel <- function(eg_idx, nutrient_code,
+                                 ylim = c(-0.35, 0.10)) {
+  sub_df <- eigengene_df %>%
+    filter(nutrient == nutrient_code) %>%
+    arrange(dil_rate)
+  
+  y_col <- paste0("EG", eg_idx)
+  y_vals <- sub_df[[y_col]]
+  
+  ggplot(sub_df, aes(x = dil_rate, y = .data[[y_col]])) +
+    geom_line(color = "black", linewidth = 0.6) +
+    geom_point(shape = 1, size = 2, color = "black") +
+    scale_x_continuous(breaks = rates_all,
+                       labels = ifelse(eg_idx == 4,
+                                       as.character(rates_all), "")) +
+    scale_y_continuous(limits = ylim,
+                       breaks = pretty(ylim, n=3)) +
+    labs(
+      x = if (eg_idx == 4) nut_labels[nutrient_code] else "",
+      y = if (nutrient_code == "G") paste0("Eigengene ", eg_idx) else ""
+    ) +
+    theme_classic(base_size = 8) +
+    theme(
+      axis.text.x  = if (eg_idx == 4) element_text(angle=45, hjust=1,
+                                                   size=6) else element_blank(),
+      axis.ticks.x = if (eg_idx == 4) element_line() else element_blank(),
+      axis.text.y  = element_text(size = 6),
+      plot.margin  = unit(c(0.5,0.5,0.5,0.5), "mm")
+    )
+}
+
+# Adaptive y-limits per eigengene
+ylims <- list(
+  EG1 = range(eigengene_df$EG1) * 1.1,
+  EG2 = range(eigengene_df$EG2) * 1.1,
+  EG3 = range(eigengene_df$EG3) * 1.1,
+  EG4 = range(eigengene_df$EG4) * 1.1
+)
+
+panels <- list()
+for (eg in 1:4) {
+  for (nut in nutrients_ordered) {
+    panels[[paste0("EG",eg,"_",nut)]] <-
+      make_eigengene_panel(eg, nut, ylim = ylims[[paste0("EG",eg)]])
+  }
+}
+
+panel_grid <- gridExtra::arrangeGrob(
+  grobs  = panels,
+  ncol   = 6,
+  nrow   = 4,
+  top    = "C  Expression levels of 4 most significant eigengenes"
+)
+
+# ── Panel B — eigenvalue barplot as ggplot ────────────────────
+frac_df <- data.frame(
+  eigengene = factor(paste0("EG",1:8), levels = paste0("EG",8:1)),
+  variance  = frac_variance[1:8]
+)
+
+panel_B <- ggplot(frac_df, aes(x = variance, y = eigengene)) +
+  geom_col(fill = c(rep("grey60",7),"#CC0000"), width = 0.7) +
+  geom_text(aes(label = ifelse(eigengene == "EG1",
+                               paste0(round(variance*100,1),"%"), "")),
+            hjust = -0.1, size = 2.5, color = "darkred") +
+  scale_x_continuous(expand = expansion(mult=c(0,0.15)),
+                     labels = scales::percent_format(accuracy=1)) +
+  labs(x = "Fraction of variance", y = NULL,
+       title = "B  Eigengene weights (eigenvalues)") +
+  theme_classic(base_size = 8) +
+  theme(axis.text.y = element_text(size = 7))
+
+# ── Assemble & save Figure 3 ──────────────────────────────────
+cat("Saving Figure 3...\n")
+
+# Full figure 3 — panels B and C side by side
+fig3 <- gridExtra::arrangeGrob(
+  panel_B,
+  panel_grid,
+  ncol   = 2,
+  widths = c(1, 3.5),
+  top    = "Figure 3 — SVD decomposition of expression data\n(Brauer et al. 2008 reproduction)"
+)
+
+ggsave("figure3_svd_panels_BC.png", fig3,
+       width = 14, height = 8, dpi = 200, bg = "white")
+cat("  → figure3_svd_panels_BC.png\n")
+
+# ── 6. Quick summary of eigengene 1 vs growth rate ────────────
+cat("\n── Correlation of Eigengene 1 with dilution rate ──\n")
+cat("  R² =", round(cor(eigengene_df$EG1, eigengene_df$dil_rate)^2, 3),
+    " (paper reports R² = 0.69)\n")
+
+cat("\nDone! Output files:\n")
+cat("  figure2_hierarchical_clustering.png\n")
+cat("  figure3_svd_panels_BC.png\n")
+} # End deferred Figure 3 block.
+-->
