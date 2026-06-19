@@ -30,9 +30,14 @@ for (p in pkgs_bio)
 for (p in pkgs_cran)
   if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
 
+if (!requireNamespace("plotly", quietly = TRUE)) {
+  stop("The plotly package is required for the interactive Figure 2 heatmap.")
+}
+
 suppressPackageStartupMessages({
   library(GEOquery)
   library(pheatmap)
+  library(plotly)
   library(here)
 })
 
@@ -288,7 +293,7 @@ stopifnot(
 
 ```
 
-```{r sample-design-table, echo=FALSE}
+```
 knitr::kable(pd_ordered, caption = "Experimental conditions")
 ```
 
@@ -330,12 +335,13 @@ expr_binned <- round(expr_raw)
 expr_binned[expr_binned < -3] <- -3
 expr_binned[expr_binned > 3] <- 3
 
-# Color scale matching paper: green = down, black = 0, red = up
-# Paper uses log2 ratios (sample / glucose-limited 0.25 reference)
+# Bright TreeView-style color scale used in the paper:
+# green = down, black = 0, red = up. The paper uses log2 ratios
+# (sample / glucose-limited 0.25 reference).
 heatmap_colors <- c(
-  "#008000", "#006000", "#003000",
+  "#00FF00", "#00AA00", "#005500",
   "#000000",
-  "#500000", "#900000", "#CC0000"
+  "#550000", "#AA0000", "#FF0000"
 )
 heatmap_breaks <- seq(-3.5, 3.5, by = 1)
 heatmap_labels <- -3:3
@@ -350,10 +356,8 @@ stopifnot(
 ```
 
 
-```{r render-figure-2, fig.width=8, fig.height=12, out.width="100%"}
+```{r render-figure-2, include=FALSE}
 figure2_path <- file.path(output_dir, "figure2_hierarchical_clustering.png")
-png(figure2_path,
-    width = 2400, height = 3600, res = 200)
 
 pheatmap(
   mat               = expr_binned,
@@ -370,15 +374,146 @@ pheatmap(
   annotation_colors = ann_colors,
   border_color      = NA,
   na_col            = "#BDBDBD",
+  filename          = figure2_path,
+  width             = 8,
+  height            = 12,
   main = paste0(
     "Figure 2 — Hierarchical clustering of expression\n",
     "across dilution rates and limiting nutrients\n",
     "(5,537 rows; UPGMA, pairwise-complete Pearson correlation)"
   )
 )
-dev.off()
+```
 
-knitr::include_graphics(figure2_path)
+The interactive heatmap follows the same clustered row order as the saved PNG.
+Hover over a cell to identify its gene and view the unbinned expression value.
+The axes are fixed so the full heatmap remains in view.
+
+```{r interactive-figure-2, echo=FALSE, fig.width=10, fig.height=11.5, out.width="100%", out.height="1100px"}
+plot_row_order <- gene_clust$order
+plot_expr_binned <- expr_binned[plot_row_order, , drop = FALSE]
+plot_expr_raw <- expr_raw[plot_row_order, , drop = FALSE]
+plot_annotation <- gene_annotation[plot_row_order, , drop = FALSE]
+
+plot_standard_name <- plot_annotation$current_standard_name
+missing_standard_name <- is.na(plot_standard_name) | plot_standard_name == ""
+plot_standard_name[missing_standard_name] <-
+  plot_annotation$gpl_gene_symbol[missing_standard_name]
+plot_standard_name[
+  is.na(plot_standard_name) | plot_standard_name == ""
+] <- "(not assigned)"
+
+plot_systematic_id <- plot_annotation$current_systematic_id
+missing_systematic_id <- is.na(plot_systematic_id) | plot_systematic_id == ""
+plot_systematic_id[missing_systematic_id] <-
+  plot_annotation$gpl_orf[missing_systematic_id]
+plot_systematic_id[
+  is.na(plot_systematic_id) | plot_systematic_id == ""
+] <- "(unresolved)"
+
+hover_text <- matrix(
+  NA_character_, nrow = nrow(plot_expr_raw), ncol = ncol(plot_expr_raw)
+)
+for (j in seq_len(ncol(plot_expr_raw))) {
+  expression_text <- ifelse(
+    is.na(plot_expr_raw[, j]), "NA", sprintf("%.2f", plot_expr_raw[, j])
+  )
+  hover_text[, j] <- paste0(
+    "Standard gene name: ", plot_standard_name,
+    "<br>Systematic ID: ", plot_systematic_id,
+    "<br>Nutrient: ", as.character(pd_ordered$nutrient[j]),
+    "<br>Dilution rate: ", sprintf("%.2f", pd_ordered$dil_rate[j]),
+    "<br>Expression value: ", expression_text
+  )
+}
+
+nutrient_names <- c(
+  G = "Glucose", N = "Nitrogen", P = "Phosphate",
+  S = "Sulfate", L = "Leucine", U = "Uracil"
+)
+nutrient_levels <- names(nutrient_names)
+nutrient_banner_shapes <- lapply(seq_along(nutrient_levels), function(i) {
+  nutrient <- nutrient_levels[i]
+  list(
+    type = "rect", xref = "paper", yref = "paper",
+    x0 = (i - 1) / length(nutrient_levels),
+    x1 = i / length(nutrient_levels),
+    y0 = 1.01, y1 = 1.055,
+    line = list(width = 0),
+    fillcolor = unname(nutrient_colors[nutrient])
+  )
+})
+nutrient_banner_labels <- lapply(seq_along(nutrient_levels), function(i) {
+  nutrient <- nutrient_levels[i]
+  list(
+    xref = "paper", yref = "paper",
+    x = (i - 0.5) / length(nutrient_levels), y = 1.032,
+    text = paste0("<b>", nutrient_names[nutrient], "</b>"),
+    showarrow = FALSE,
+    font = list(color = "white", size = 12),
+    xanchor = "center", yanchor = "middle"
+  )
+})
+
+bottom_sample_labels <- paste0(
+  as.character(pd_ordered$nutrient), " / ",
+  sprintf("%.2f", pd_ordered$dil_rate)
+)
+
+figure2_interactive <- plot_ly(
+  x = colnames(plot_expr_binned),
+  y = seq_len(nrow(plot_expr_binned)),
+  z = plot_expr_binned,
+  type = "heatmap",
+  colors = heatmap_colors,
+  zmin = -3,
+  zmax = 3,
+  text = hover_text,
+  hoverinfo = "text",
+  colorbar = list(
+    title = "log2 ratio",
+    tickmode = "array",
+    tickvals = heatmap_labels,
+    ticktext = as.character(heatmap_labels)
+  ),
+  showscale = TRUE
+) |>
+  layout(
+    title = list(
+      text = paste0(
+        "Figure 2 — Hierarchical clustering of expression",
+        "<br><sup>5,537 rows; UPGMA, pairwise-complete Pearson correlation</sup>"
+      )
+    ),
+    xaxis = list(
+      title = "Nutrient / dilution rate",
+      side = "bottom",
+      tickmode = "array",
+      tickvals = colnames(plot_expr_binned),
+      ticktext = bottom_sample_labels,
+      tickangle = -90,
+      fixedrange = TRUE
+    ),
+    yaxis = list(
+      title = "Clustered genes",
+      autorange = "reversed",
+      showticklabels = FALSE,
+      fixedrange = TRUE
+    ),
+    shapes = nutrient_banner_shapes,
+    annotations = nutrient_banner_labels,
+    plot_bgcolor = "#BDBDBD",
+    height = 1100,
+    margin = list(l = 70, r = 90, b = 120, t = 155)
+  ) |>
+  config(
+    scrollZoom = FALSE,
+    displayModeBar = FALSE,
+    doubleClick = FALSE,
+    displaylogo = FALSE
+  )
+
+figure2_interactive
 ```
 
 The reproduced heatmap is saved to
@@ -389,11 +524,9 @@ and the annotation audit is saved to
 # Identify the phosphate-specific cluster
 
 The paper describes a 133-gene cluster induced specifically during phosphate
-limitation. Two complementary definitions are evaluated here. The fixed rule
-requires a strong average phosphate signal, a low non-phosphate background,
-a minimum phosphate contrast, and consistent phosphate elevation at every
-matched dilution rate. The distribution-based method ranks all rows by a
-robust phosphate-specificity score.
+limitation. The fixed rule below requires a strong average phosphate signal, a
+low non-phosphate background, a minimum phosphate contrast, and consistent
+phosphate elevation at every matched dilution rate.
 
 ```{r phosphate-specificity}
 is_p <- grepl("^P", colnames(expr_raw))
@@ -420,83 +553,75 @@ phosphate_fixed <- (
   p_consistency_count == length(p_cols)
 )
 
-# Robust distribution score: phosphate median contrast standardized by the
-# non-phosphate median absolute deviation. The 0.1 floor prevents unstable
-# scores for nearly invariant rows.
-median_p <- apply(expr_raw[, is_p, drop = FALSE], 1, median, na.rm = TRUE)
-median_non_p <- apply(
-  expr_raw[, !is_p, drop = FALSE], 1, median, na.rm = TRUE
-)
-background_mad <- apply(
-  expr_raw[, !is_p, drop = FALSE], 1, mad, na.rm = TRUE
-)
-p_specificity_score <- (
-  median_p - median_non_p
-) / (background_mad + 0.1)
+stopifnot(sum(phosphate_fixed) == 133L)
 
-p_specificity_rank <- rank(
-  -p_specificity_score, ties.method = "first", na.last = "keep"
-)
-phosphate_ranked <- !is.na(p_specificity_rank) & p_specificity_rank <= 133
+# Average each gene across the six dilution rates for each nutrient.
+nutrient_codes <- c("G", "N", "P", "S", "L", "U")
+nutrient_means <- vapply(nutrient_codes, function(nutrient) {
+  rowMeans(
+    expr_raw[, grepl(paste0("^", nutrient), colnames(expr_raw)), drop = FALSE],
+    na.rm = TRUE
+  )
+}, numeric(nrow(expr_raw)))
+colnames(nutrient_means) <- nutrient_codes
 
-stopifnot(
-  sum(phosphate_fixed) == 133L,
-  sum(phosphate_ranked, na.rm = TRUE) == 133L
-)
+fixed_rows <- which(phosphate_fixed)
+# Ordering is for presentation only; membership is determined entirely by the
+# fixed thresholds above.
+fixed_rows <- fixed_rows[order(p_effect[fixed_rows], decreasing = TRUE)]
 
-phosphate_candidates <- cbind(
-  gene_annotation,
-  mean_p = mean_p,
-  mean_non_p = mean_non_p,
-  p_effect = p_effect,
-  p_consistency_count = p_consistency_count,
-  median_p = median_p,
-  median_non_p = median_non_p,
-  background_mad = background_mad,
-  p_specificity_score = p_specificity_score,
-  p_specificity_rank = p_specificity_rank,
-  fixed_threshold_member = phosphate_fixed,
-  top_133_score_member = phosphate_ranked
-)
+fixed_standard_name <- gene_annotation$current_standard_name[fixed_rows]
+missing_standard <- is.na(fixed_standard_name) | fixed_standard_name == ""
+fixed_standard_name[missing_standard] <-
+  gene_annotation$gpl_gene_symbol[fixed_rows][missing_standard]
 
-phosphate_candidates <- phosphate_candidates[
-  order(phosphate_candidates$p_specificity_rank, na.last = TRUE),
-]
+fixed_systematic_id <- gene_annotation$current_systematic_id[fixed_rows]
+missing_systematic <- is.na(fixed_systematic_id) | fixed_systematic_id == ""
+fixed_systematic_id[missing_systematic] <-
+  gene_annotation$gpl_orf[fixed_rows][missing_systematic]
+
+phosphate_gene_table <- data.frame(
+  `Probe UID` = gene_annotation$probe_uid[fixed_rows],
+  `Standard gene name` = fixed_standard_name,
+  `Systematic ID` = fixed_systematic_id,
+  `Feature type` = gene_annotation$current_feature_type[fixed_rows],
+  Qualifier = gene_annotation$current_qualifier[fixed_rows],
+  Glucose = round(nutrient_means[fixed_rows, "G"], 3),
+  Nitrogen = round(nutrient_means[fixed_rows, "N"], 3),
+  Phosphate = round(nutrient_means[fixed_rows, "P"], 3),
+  Sulfate = round(nutrient_means[fixed_rows, "S"], 3),
+  Leucine = round(nutrient_means[fixed_rows, "L"], 3),
+  Uracil = round(nutrient_means[fixed_rows, "U"], 3),
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
 
 phosphate_output_path <- file.path(
   output_dir, "figure2_phosphate_specific_candidates.csv"
 )
 write.csv(
-  phosphate_candidates,
+  phosphate_gene_table,
   phosphate_output_path,
   row.names = FALSE,
   na = ""
 )
 ```
 
-The fixed rule identifies **`r sum(phosphate_fixed)` rows**. The robust score
-independently selects its top **`r sum(phosphate_ranked, na.rm = TRUE)` rows**.
-The two definitions share **`r sum(phosphate_fixed & phosphate_ranked, na.rm = TRUE)`
-rows** (Jaccard similarity
-**`r round(sum(phosphate_fixed & phosphate_ranked, na.rm = TRUE) / sum(phosphate_fixed | phosphate_ranked, na.rm = TRUE), 3)`**).
-The fixed-rule count reproduces the reported cluster size, but matching the
-number 133 alone does not establish that its membership is identical to the
-manually identified dendrogram branch in the paper.
+The fixed rule identifies **`r sum(phosphate_fixed)` genes**, reproducing the
+reported cluster size. Matching the number 133 alone does not establish that
+its membership is identical to the manually identified dendrogram branch in
+the paper. The table is ordered by decreasing mean phosphate-versus-other
+nutrient contrast; this ordering does not affect membership.
 
-```{r phosphate-method-summary, echo=FALSE}
-phosphate_summary <- data.frame(
-  Method = c(
-    "Fixed thresholds",
-    "Top robust specificity scores",
-    "Intersection"
+```{r phosphate-gene-table, echo=FALSE}
+knitr::kable(
+  phosphate_gene_table,
+  caption = paste0(
+    "The 133 fixed-threshold phosphate-specific genes. Expression columns ",
+    "are means across the six dilution rates for each nutrient."
   ),
-  Rows = c(
-    sum(phosphate_fixed),
-    sum(phosphate_ranked, na.rm = TRUE),
-    sum(phosphate_fixed & phosphate_ranked, na.rm = TRUE)
-  )
+  align = c("l", "l", "l", "l", "l", rep("r", 6))
 )
-knitr::kable(phosphate_summary, caption = "Phosphate-specific candidate sets")
 ```
 
 The fixed-rule candidates show the expected phosphate-specific block across
@@ -529,8 +654,7 @@ pheatmap(
 )
 ```
 
-The complete ranking, thresholds, membership flags, and current annotations
-are available in
+The same 133-gene annotation and nutrient-mean table is available as
 [`output/figure2_phosphate_specific_candidates.csv`](../output/figure2_phosphate_specific_candidates.csv).
 
 ## Why PHO84 is absent from the authors' processed matrix

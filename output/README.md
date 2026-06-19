@@ -8,8 +8,8 @@
   Agilent probe UID to its historical CDT identifier, GPL884 annotation, and
   current SGD identifier, standard name, feature type, qualifier, and mapping
   status.
-- `figure2_phosphate_specific_candidates.csv`: phosphate-specificity metrics,
-  ranks, fixed-threshold membership, top-133 robust-score membership, and gene
-  annotations for all 5,537 rows.
+- `figure2_phosphate_specific_candidates.csv`: the 133 genes selected by the
+  fixed phosphate-specific thresholds, with current annotations and mean
+  expression across the six dilution rates for each nutrient.
 
 Figure 3 outputs are intentionally deferred.

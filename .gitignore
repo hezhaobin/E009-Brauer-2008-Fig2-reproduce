@@ -4,3 +4,6 @@
 
 # Local RStudio project state
 /.Rproj.user/
+
+# RSconnect
+**/rsconnect/
